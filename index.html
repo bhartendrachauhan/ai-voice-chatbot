@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AudioWorklet WAV Streaming</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    button { padding: 10px 20px; font-size: 16px; margin-right: 10px; }
+    #status { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>🎤 AudioWorklet Streaming with WAV Playback</h1>
+  <button id="start">Start Recording</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="status">Status: Idle</div>
+
+  <script>
+    let socket, audioContext, workletNode, stream;
+    let isRecording = true;
+    let playedBuffers = new Set();
+    let audioQueue = [];
+    let playingAudio = false;
+    let pcmBuffer = [];
+
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    const statusDiv = document.getElementById('status');
+
+    async function initAudioWorklet() {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioContext = new AudioContext({ sampleRate: 16000 });
+
+      await audioContext.audioWorklet.addModule(URL.createObjectURL(new Blob([`
+        class RecorderProcessor extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0];
+            if (input && input[0]) {
+              this.port.postMessage(input[0]);
+            }
+            return true;
+          }
+        }
+        registerProcessor('recorder-processor', RecorderProcessor);
+      `], { type: 'application/javascript' })));
+
+      workletNode = new AudioWorkletNode(audioContext, 'recorder-processor');
+      workletNode.port.onmessage = (event) => {
+        if (!isRecording) return;
+
+        const float32Data = event.data;
+        const pcm = new Int16Array(float32Data.length);
+        for (let i = 0; i < float32Data.length; i++) {
+          let s = Math.max(-1, Math.min(1, float32Data[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        pcmBuffer.push(...pcm);
+
+        const chunkSize = 480; // 480 samples = 960 bytes (30ms at 16kHz)
+        while (pcmBuffer.length >= chunkSize) {
+          const chunk = pcmBuffer.splice(0, chunkSize);
+          const buffer = new Int16Array(chunk).buffer;
+
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send(buffer);
+          }
+        }
+      };
+
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(workletNode);
+      workletNode.connect(audioContext.destination); // optional
+    }
+
+    async function playNextInQueue() {
+      if (audioQueue.length === 0 || playingAudio) return;
+
+      playingAudio = true;
+      const { buffer, hash } = audioQueue.shift();
+
+      if (playedBuffers.has(hash)) {
+        playingAudio = false;
+        playNextInQueue();
+        return;
+      }
+
+      playedBuffers.add(hash);
+
+      try {
+        const audioBuffer = await audioContext.decodeAudioData(buffer.slice(0));
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.onended = () => {
+          playingAudio = false;
+          if (audioQueue.length === 0) {
+            isRecording = true;
+            statusDiv.textContent = "Status: Resumed recording...";
+          } else {
+            playNextInQueue();
+          }
+        };
+        source.start();
+      } catch (err) {
+        console.error("Error decoding audio:", err);
+        playingAudio = false;
+        playNextInQueue();
+      }
+    }
+
+    function arrayBufferToHash(buffer) {
+      let hash = 0;
+      const view = new Uint8Array(buffer);
+      for (let i = 0; i < view.length; i++) {
+        hash = (hash * 31 + view[i]) >>> 0;
+      }
+      return hash;
+    }
+
+    startBtn.onclick = async () => {
+      socket = new WebSocket("ws://localhost:5001/ws/audio");
+      socket.binaryType = "arraybuffer";
+
+      socket.onopen = async () => {
+        statusDiv.textContent = "Status: WebSocket connected, starting AudioWorklet...";
+        await initAudioWorklet();
+        isRecording = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        statusDiv.textContent = "Status: Recording and sending 960-byte PCM chunks...";
+      };
+
+      socket.onmessage = async (event) => {
+        isRecording = false;
+        pcmBuffer = [];
+        statusDiv.textContent = "Status: Received audio... Paused recording.";
+
+        const buffer = event.data;
+        const hash = arrayBufferToHash(buffer);
+
+        audioQueue.push({ buffer, hash });
+        playNextInQueue();
+      };
+
+      socket.onerror = (e) => {
+        console.error("WebSocket error", e);
+        statusDiv.textContent = "Status: WebSocket error.";
+      };
+    };
+
+    stopBtn.onclick = () => {
+      isRecording = false;
+      if (workletNode) workletNode.disconnect();
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      if (audioContext) audioContext.close();
+      if (socket) socket.close();
+
+      statusDiv.textContent = "Status: Stopped.";
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    };
+  </script>
+</body>
+</html>
